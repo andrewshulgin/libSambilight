@@ -25,9 +25,12 @@
 #include <string.h>
 #include <limits.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
-#include <sys/time.h> 
-#include <sys/stat.h>  
+#include <sys/time.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <dlfcn.h>
 #include <glob.h>
@@ -35,7 +38,6 @@
 #include <pthread.h>
 #include <math.h>
 #include <sys/syscall.h>
-#include <linux/kdev_t.h>
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -53,7 +55,8 @@
 
 unsigned char osd_enabled = 1, black_border_state = 1, black_border_enabled = 1, external_led_state = 1, external_led_enabled = 0, gfx_lib = 1, test_pattern = 0, default_profile = 0, test_capture = 0, threading = 1, force_update = 0, single_shot_mode = 0, fps_test_mode = 0;
 unsigned long fps_test_frames = 0, capture_frequency = 30;
-int serial = -1;
+int sockfd = -1;
+struct sockaddr_in servaddr;
 void* hl;
 led_manager_config_t led_config = { 35, 19, 7, 68, 480, 270, "RGB", 0, 1 };
 
@@ -476,189 +479,6 @@ void load_profiles_config(const char* path) {
 	}
 }
 
-static int insmod(const char* module_name) {
-	int fd, ret = -1;
-	size_t image_size;
-	struct stat st;
-	void* image;
-	char* params = "";
-	fd = open(module_name, O_RDONLY);
-	if (fd >= 0) {
-		fstat(fd, &st);
-		image_size = st.st_size;
-		image = malloc(image_size);
-		ret = read(fd, image, image_size);
-		close(fd);
-		ret = syscall(__NR_init_module, image, image_size, params);
-		sleep(1);
-		free(image);
-	}
-	return ret;
-}
-
-static int mknod_acm(const char* device_name) {
-	char dev[100] = "";
-	char cmd[150] = "";
-	FILE* fp;
-	char* ptr;
-	char master_str[10] = "", alias_str[10] = "";
-	long master, alias;
-
-	if (access(device_name, F_OK) == 0) {
-		return 0;
-	}
-
-	memset(dev, 0, sizeof(dev));
-	sprintf(dev, "/sys/class/tty/%s", device_name + 4);
-	if (access(dev, F_OK) != 0) {
-		return -1;
-	}
-
-	sprintf(cmd, "cat %s/dev", dev);
-	fp = popen(cmd, "r");
-	memset(dev, 0, sizeof(dev));
-	ptr = fgets(dev, sizeof(dev), fp);
-	fclose(fp);
-
-	ptr = strstr(dev, ":");
-
-	memcpy(master_str, dev, ptr - dev);
-	master_str[ptr - dev] = 0;
-
-	memcpy(alias_str, ptr + 1, strlen(dev) - (ptr - dev) - 2);
-	alias_str[strlen(dev) - (ptr - dev) - 2] = 0;
-
-	master = atol(master_str);
-	alias = atol(alias_str);
-
-	//mknod /dtv/ttyACM0 c $(echo $(cat /sys/class/tty/ttyACM0/dev) | tr ":" "\n")
-	return mknod(device_name, S_IFCHR | 0666, MKDEV(master, alias));
-}
-
-static int open_serial(const char* device, unsigned int baudrate) {
-	int fd = -1, i, j = 0;
-	char dev[50] = "";
-
-	if (strlen(device)) {
-		strcpy(dev, device);
-
-		while (fd < 0 && j < 3) {
-			if (strstr(dev, "ACM")) {
-				insmod("/lib/modules/cdc-acm.ko");
-				mknod_acm(device);
-			}
-			else {
-				insmod("/lib/modules/usbserial.ko");
-				insmod("/lib/modules/ftdi_sio.ko");
-			}
-			fd = open(dev, O_RDWR | O_NOCTTY);
-
-			if (fd < 0) {
-				log("Could not open serial port %s! Retries %d\n", dev, j);
-				sleep(5);
-				j++;
-			}
-		}
-	}
-	else {
-		while (fd < 0 && j < 3) {
-			insmod("/lib/modules/usbserial.ko");
-			insmod("/lib/modules/ftdi_sio.ko");
-
-			for (i = 0; i < 3 && fd < 0; i++) {
-				memset(dev, 0, sizeof(dev));
-				sprintf(dev, "/dev/ttyUSB%d", i);
-				fd = open(dev, O_RDWR | O_NOCTTY);
-			}
-
-			if (fd < 0) {
-				insmod("/lib/modules/cdc-acm.ko");
-
-				for (i = 0; i < 3 && fd < 0; i++) {
-					memset(dev, 0, sizeof(dev));
-					sprintf(dev, "/dtv/ttyACM%d", i);
-					mknod_acm(dev);
-					fd = open(dev, O_RDWR | O_NOCTTY);
-				}
-			}
-
-			if (fd < 0) {
-				log("Could not find serial port! Retries %d\n", j);
-				sleep(5);
-				j++;
-			}
-		}
-	}
-
-	if (fd >= 0) {
-		struct termios port_settings;
-		tcgetattr(fd, &port_settings);
-
-		port_settings.c_cflag &= ~PARENB;
-		port_settings.c_cflag &= ~CSTOPB;
-		port_settings.c_cflag |= CS8;
-		port_settings.c_cflag &= ~CRTSCTS;
-		port_settings.c_cflag |= CREAD | CLOCAL;
-		port_settings.c_cflag &= ~HUPCL;
-		port_settings.c_lflag &= ~ICANON;
-		port_settings.c_lflag &= ~ECHO;
-		port_settings.c_lflag &= ~ECHOE;
-		port_settings.c_lflag &= ~ECHONL;
-		port_settings.c_lflag &= ~ISIG;
-		port_settings.c_iflag &= ~(IXON | IXOFF | IXANY);
-		port_settings.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL);
-		port_settings.c_oflag &= ~OPOST;
-		port_settings.c_oflag &= ~ONLCR;
-
-		if (strstr(dev, "ACM")) {
-			log("Serial acm available %s\n", dev);
-		}
-		else {
-			switch (baudrate) {
-			case 2000000:
-				cfsetispeed(&port_settings, B2000000);
-				cfsetospeed(&port_settings, B2000000);
-				break;
-			case 1000000:
-				cfsetispeed(&port_settings, B1000000);
-				cfsetospeed(&port_settings, B1000000);
-				break;
-			case 576000:
-				cfsetispeed(&port_settings, B576000);
-				cfsetospeed(&port_settings, B576000);
-				break;
-			case 500000:
-				cfsetispeed(&port_settings, B500000);
-				cfsetospeed(&port_settings, B500000);
-				break;
-			case 460800:
-				cfsetispeed(&port_settings, B460800);
-				cfsetospeed(&port_settings, B460800);
-				break;
-			case 230400:
-				cfsetispeed(&port_settings, B230400);
-				cfsetospeed(&port_settings, B230400);
-				break;
-			case 115200:
-				cfsetispeed(&port_settings, B115200);
-				cfsetospeed(&port_settings, B115200);
-				break;
-			default:;
-				cfsetispeed(&port_settings, B921600);
-				cfsetospeed(&port_settings, B921600);
-			}
-
-			port_settings.c_cc[VTIME] = 1;
-			port_settings.c_cc[VMIN] = 0;
-
-			log("Serial available %s @%u\n", dev, baudrate);
-		}
-
-		tcsetattr(fd, TCSANOW, &port_settings);
-	}
-	return fd;
-}
-
 void save_capture(const unsigned char* frame, unsigned int width, unsigned int heigth, const char* color_order, unsigned int capture_pos) {
 	unsigned char bmpHeader[54] = { 0x42, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x36, 0x00, 0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	unsigned char* buffer;
@@ -868,16 +688,18 @@ void* sambiligth_thread(void* params) {
 	leds_count = led_manager_init(&led_config, &led_profiles[default_profile]);
 	log("Led manager init\n");
 
-	data_size = (leds_count * 3) + header_size;
+	data_size = (leds_count * 3) + header_size + 1;
 	if (external_led_enabled) {
 		data_size++;
 	}
 
 	data = malloc(data_size);
-	memcpy(data, "Ada", 3);
-	data[3] = ((leds_count - 1) >> 8) & 0xff;
-	data[4] = (leds_count - 1) & 0xff;
-	data[5] = data[3] ^ data[4] ^ 0x55;
+
+	char header[] = {0x9c, 0xda, (leds_count * 3) >> 8, (leds_count * 3) & 0xff, 0x01, 0x01};
+	memcpy(data, header, sizeof(header));
+	// data[3] = ((leds_count - 1) >> 8) & 0xff;
+	// data[4] = (leds_count - 1) & 0xff;
+	// data[5] = data[3] ^ data[4] ^ 0x55;
 	memset(data + header_size, 0, data_size - header_size);
 
 	if (external_led_enabled) {
@@ -1034,7 +856,10 @@ void* sambiligth_thread(void* params) {
 			}
 
 			if (led_manager_argb8888_to_leds(buffer, &data[header_size])) {
-				bytesWritten = write(serial, data, data_size);
+				data[data_size - 1] = 0x36;
+				sendto(sockfd, (const char *)data, data_size, 0, (const struct sockaddr *) &servaddr, sizeof(servaddr));
+				// bytesWritten = write(serial, data, data_size);
+				bytesWritten = data_size;
 
 				fps_counter++;
 				if (black_border_enabled && fps_counter >= 15) {
@@ -1073,7 +898,9 @@ void* sambiligth_thread(void* params) {
 				}
 			}
 			else if (force_update) {
-				bytesWritten = write(serial, data, data_size);
+				// bytesWritten = write(serial, data, data_size);
+				sendto(sockfd, (const char *)data, data_size, 0, (const struct sockaddr *) &servaddr, sizeof(servaddr));
+				bytesWritten = data_size;
 			}
 
 			if (fps_test_mode) {
@@ -1127,7 +954,8 @@ void* sambiligth_thread(void* params) {
 	}
 
 	free(data);
-	close(serial);
+	// close(serial);
+	close(sockfd);
 
 	led_manager_deinit();
 
@@ -1153,10 +981,10 @@ EXTERN_C void lib_init(void* _h, const char* libpath)
 
 	int argc, exit = 0;
 	char* argv[512], * optstr, path[PATH_MAX];
-	char device[50] = "";
+	char host[50] = "";
 	char model_code = 'X';
 	unsigned char tv_remote_enabled = 1;
-	unsigned long baudrate = 921600;
+	unsigned long port = 21324;
 	pthread_t thread;
 	size_t len;
 
@@ -1310,13 +1138,13 @@ EXTERN_C void lib_init(void* _h, const char* libpath)
 	if (optstr && strlen(optstr))
 		gfx_lib = atoi(optstr);
 
-	optstr = getOptArg(argv, argc, "DEVICE:");
+	optstr = getOptArg(argv, argc, "HOST:");
 	if (optstr && strlen(optstr))
-		strncpy(device, optstr, sizeof(device));
+		strncpy(host, optstr, sizeof(host));
 
-	optstr = getOptArg(argv, argc, "BAUDRATE:");
+	optstr = getOptArg(argv, argc, "PORT:");
 	if (optstr && strlen(optstr))
-		baudrate = atol(optstr);
+		port = atol(optstr);
 
 	optstr = getOptArg(argv, argc, "TEST_FRAMES:");
 	if (optstr && strlen(optstr))
@@ -1334,7 +1162,7 @@ EXTERN_C void lib_init(void* _h, const char* libpath)
 	if (optstr && strlen(optstr))
 		test_capture = atoi(optstr);
 
-	optstr = getOptArg(argv, argc, "FORCE_UPDATE:");
+	optstr = getOptArg(argv, argc, "	:");
 	if (optstr && strlen(optstr))
 		force_update = atoi(optstr);
 
@@ -1388,9 +1216,16 @@ EXTERN_C void lib_init(void* _h, const char* libpath)
 		threading = 0;
 	}
 
-	serial = open_serial(device, baudrate);
-	if (serial >= 0) {
-		log("Serial open\n");
+	// serial = open_serial(device, baudrate);
+
+	sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+	memset(&servaddr, 0, sizeof(servaddr));
+	servaddr.sin_family = AF_INET;
+	servaddr.sin_port = htons(port);
+	servaddr.sin_addr.s_addr = inet_addr(host);
+
+	if (sockfd >= 0) {
+		log("Socket open\n");
 
 		if (threading == 0) {
 			sambiligth_thread(NULL);
